@@ -5,17 +5,30 @@ import io
 import os
 import pickle
 import re
+import subprocess
 import sys
+import tempfile
 
 def sha1_path(path):
+    with open(path, 'rb') as f:
+        return sha1_file(f)
+def sha1_file(f):
     hasher = hashlib.sha1()
     BLOCKSIZE=65536
-    with open(path, 'rb') as f:
+    buf = f.read(BLOCKSIZE)
+    while len(buf) > 0:
+        hasher.update(buf)
         buf = f.read(BLOCKSIZE)
-        while len(buf) > 0:
-            hasher.update(buf)
-            buf = f.read(BLOCKSIZE)
     return hasher.hexdigest()
+def sha1_directory(d):
+    return subprocess.getoutput("find {} -type f | sort | xargs sha1sum | cut -f1 -d' ' | sha1sum | cut -f1 -d' '".format(d))
+
+def copy_write(fr, to):
+    BLOCKSIZE=65536
+    buf = fr.read(BLOCKSIZE)
+    while len(buf) > 0:
+        to.write(buf)
+        buf = fr.read(BLOCKSIZE)
 
 class MismatchHashException(Exception):
     def __init__(self, rel_path, actual_sha, expected_sha):
@@ -67,39 +80,118 @@ class RepoParse():
         'info/exclude': 'c879df015d97615050afa7b9641e3352a1e701ac',
     }
     PARSED_FILES = {
-        'packed-refs': 'store_unchanged',
-        'config': 'store_unchanged',
         'HEAD': 'store_unchanged',
-        re.compile('objects/pack/pack-.*\.pack'): 'store_unchanged',
-        re.compile('objects/pack/pack-.*\.idx'): 'store_unchanged',
+        'config': 'store_unchanged',
+        'packed-refs': 'store_unchanged',
+        'info/refs': 'store_unchanged',
+        'objects/info/packs': 'store_unchanged',
+        re.compile('^objects/[0-9a-f]{2}$'): 'store_directory',
+        re.compile('^objects/[0-9a-f]{2}/[0-9a-f]{38}$'): 'store_object_file',
+        re.compile('^objects/pack/pack-.*\.pack$'): 'store_packfile_and_index',
     }
 
-    def __init__(self, base_repo_path=None):
+    def __init__(self, base_repo_path=None, blob_store=None):
         self.base = base_repo_path
         self.expected_files = dict()
         self.unexpected_files = dict()
         self.all_files = dict()
         for rel_path, sha1 in self.EXPECTED_STATIC_FILES.items():
             self.expect_file(rel_path, sha1)
+        self.working_dir = tempfile.TemporaryDirectory()
 
-        self.store = {}
+        if blob_store is None:
+            blob_store = {}
+        self.store = blob_store
         self.output = {}
 
     def store_blob(self, b):
         h = hashlib.sha1(b).hexdigest()
-        self.store[h] = b
+        if h in self.store:
+            assert self.store[h] == b, "Two distinct blobs stored with the same hash (collision): {}".format(h)
+        else:
+            self.store[h] = b
         return h
 
     def store_unchanged(self, rel_path, f):
         c = f.read()
         h = self.store_blob(c)
-        self.output[rel_path] = ('cat', h)
+        self.output[rel_path] = ('unstore_unchanged', rel_path, h)
+    def unstore_unchanged(self, rel_path, sha):
+        abs_path = os.path.join(self.base, rel_path)
+        with open(abs_path, 'wb') as f:
+            f.write(self.store[sha])
+
+    def store_directory(self, rel_path):
+        self.output[rel_path] = ('unstore_directory', rel_path)
+    def unstore_directory(self, rel_path):
+        abs_path = os.path.join(self.base, rel_path)
+        os.mkdir(abs_path)
+
+    def store_expected_directory(self, rel_path):
+        self.output[rel_path] = ('unstore_expected_directory', rel_path)
+    def unstore_expected_directory(self, rel_path):
+        abs_path = os.path.join(self.base, rel_path)
+        os.mkdir(abs_path)
+
+    def store_expected_file(self, rel_path):
+        self.output[rel_path] = ('unstore_expected_file', rel_path, self.expected_files[rel_path])
+    def unstore_expected_file(self, rel_path, sha):
+        abs_path = os.path.join(self.base, rel_path)
+        with open(abs_path, 'wb') as f:
+            f.write(self.store[sha])
+
+    def store_generated_index(self, rel_path, f_from):
+        rel_from = rel_path[:-4]+'.pack'
+        # Use 'git' command to generate index file
+        with self.generate_index(f_from) as index_file:
+            index_sha = sha1_file(index_file)
+
+        # Mark index file in current input as generated
+        self.expect_file(rel_path, index_sha)
+
+        self.output[rel_path] = ('unstore_generated_index', rel_path, rel_from, index_sha)
+    def unstore_generated_index(self, rel_path, rel_from, sha):
+        abs_path = os.path.join(self.base, rel_path)
+        abs_from_file = os.path.join(self.base, rel_from)
+        assert os.path.exists(abs_from_file), "Generated index file relies on non-existent packfile: {}".format(from_file)
+        with open(abs_from_file, 'rb') as f:
+            index_file = self.generate_index(f)
+        assert sha1_file(index_file) == sha, "Generated index file had wrong hash: {}".format(rel_path)
+        index_file.seek(0)
+        with open(abs_path, 'wb') as f:
+            copy_write(index_file, f)
+        index_file.close()
+
+    def store_object_file(self, rel_path, f):
+        self.store_unchanged(rel_path, f)
+
+    def store_packfile_and_index(self, rel_path, f):
+        # Store packfile
+        self.store_unchanged(rel_path, f)
+        f.seek(0)
+
+        # Store pack index file
+        index_path = rel_path[:-5]+'.idx'
+        self.store_generated_index(index_path, f)
+
+    def generate_index(self, f):
+        pack_path = os.path.join(self.working_dir.name, 'a.pack')
+        index_path = os.path.join(self.working_dir.name, 'a.idx')
+        with open(pack_path, 'wb') as f2:
+            copy_write(f, f2)
+        with open(os.devnull, 'w') as FNULL:
+            subprocess.call(["git", "index-pack", pack_path], stdout=FNULL)
+        os.remove(pack_path)
+        index_file = open(index_path, 'rb')
+        os.remove(index_path)
+        return index_file
 
     def found_expected(self, rel_path, is_dir):
-        if is_dir:
-            self.output[rel_path] = ('make_dir', rel_path)
-        else:
-            self.output[rel_path] = ('cat', self.expected_files[rel_path])
+        if rel_path in self.EXPECTED_STATIC_FILES:
+            if is_dir:
+                self.store_expected_directory(rel_path)
+            else:
+                self.store_expected_file(rel_path)
 
     def expect_file(self, rel_path, expected_sha):
         self.expected_files[rel_path] = expected_sha
@@ -110,7 +202,7 @@ class RepoParse():
             else:
                 raise MismatchHashException(rel_path, actual_sha, expected_sha)
 
-    def parse_file(self, abs_path, is_dir):
+    def _parse_file(self, abs_path, is_dir):
         rel_path = os.path.relpath(abs_path, self.base)
         if is_dir:
             sha = DIRECTORY_SHA
@@ -132,38 +224,48 @@ class RepoParse():
             regex_keys = [r for r in self.PARSED_FILES.keys() if isinstance(r, re.Pattern)]
             for r in regex_keys:
                 if r.match(rel_path):
-                    assert not is_dir
                     assert not matched
-                    with open(abs_path, 'rb') as f:
-                        getattr(self, self.PARSED_FILES[r])(rel_path, f)
+                    if is_dir:
+                        getattr(self, self.PARSED_FILES[r])(rel_path)
+                    else:
+                        with open(abs_path, 'rb') as f:
+                            getattr(self, self.PARSED_FILES[r])(rel_path, f)
                     matched = True
             if not matched:
                 self.unexpected_files[rel_path] = sha
 
-    def finalize(self):
+    def _finalize(self):
         for f in self.expected_files:
             if f not in self.all_files:
                 raise MissingFileException(f, is_directory=(self.expected_files[f] == DIRECTORY_SHA))
         for f in self.unexpected_files:
             raise UnexpectedFileException(f, is_directory=(self.unexpected_files[f] == DIRECTORY_SHA))
 
-    @classmethod
-    def parse(cls, bare_repo_path):
-        parser = RepoParse(bare_repo_path)
+    def get_size(self, blobs=True):
+        size = 0
+        if blobs:
+            for h,v in self.store.items():
+                size += len(v)
+        size += len(pickle.dumps(self.output))
+        return size
+
+    def parse(self):
         unexpected = []
-        for root, dirs, files in os.walk(bare_repo_path):
+        for root, dirs, files in os.walk(self.base):
             for name in files:
                 abs_path = os.path.join(root, name)
-                parser.parse_file(abs_path, is_dir=False)
+                self._parse_file(abs_path, is_dir=False)
 
             for name in dirs:
                 abs_path = os.path.join(root, name)
-                parser.parse_file(abs_path, is_dir=True)
-        parser.finalize()
-        return parser
+                self._parse_file(abs_path, is_dir=True)
+        self._finalize()
 
     def serialize(self, f):
         pickle.dump(self.store, f)
+        pickle.dump(self.output, f)
+
+    def serialize_output(self, f):
         pickle.dump(self.output, f)
 
     @classmethod
@@ -180,19 +282,30 @@ class RepoParse():
                 c = f.read()
                 self.store_blob(c)
         for rel_path, (action, *args) in self.output.items():
-            abs_path = os.path.join(extract_path, rel_path)
-            if action == 'make_dir':
-                os.mkdir(abs_path)
-            elif action == 'cat':
-                with open(abs_path, 'wb') as f:
-                    f.write(self.store[args[0]])
+            if hasattr(self, action):
+                getattr(self, action)(*args)
             else:
                 raise Exception("Unexpected output action {}".format(action))
 
 if __name__ == '__main__':
-    parsed = RepoParse.parse(sys.argv[1])
-    out = io.BytesIO()
-    parsed.serialize(out)
-    out.seek(0)
-    ds = RepoParse.unserialize(out)
-    ds.unparse("/tmp/test")
+    parsers = {}
+    common = {}
+    for repo in sys.argv[1:]:
+        parsers[repo] = RepoParse(repo, blob_store=common)
+        parsers[repo].parse()
+        expected_sha1 = sha1_directory(repo)
+        out = io.BytesIO()
+        parsers[repo].serialize(out)
+        out.seek(0)
+        ds = RepoParse.unserialize(out)
+        d = tempfile.mkdtemp()
+        ds.unparse(d)
+        actual_sha1 = sha1_directory(d)
+        if expected_sha1 == actual_sha1:
+            print("Size of repo (no blobs) {}: {:,}".format(repo, parsers[repo].get_size(blobs=False)))
+        else:
+            print("Failure--some mismatch. Temp directory was: {}".format(d))
+        subprocess.call(["rm", "-r", "-f", d])
+    print("Success--exact reproduction for all repos")
+    any_parser = parsers[sys.argv[1]]
+    print("Size of combined blobs: {:,}".format(any_parser.get_size() - any_parser.get_size(blobs=False)))

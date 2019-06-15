@@ -55,20 +55,45 @@ def git_hash(t, b):
     buf.seek(0)
     return hashlib.sha1(buf.getbuffer()).hexdigest()
 
+def recompress(b):
+    import lzma
+    if CHECK:
+        d = zlib.decompress(b)
+        rezcompressed = zlib.compress(d)
+        assert rezcompressed == b, "Zlib compression not reversible"
+    return d
+    #return lzma.compress(d, lzma.FORMAT_ALONE)
+
+def derecompress(b):
+    import lzma
+    #d = lzma.decompress(b, lzma.FORMAT_ALONE)
+    d=b
+    c = zlib.compress(d)
+    return c
+
 def decompress(f):
     do = zlib.decompressobj()
+    b = b''
     compressed_start = f.tell()
     decompressed = io.BytesIO()
 
     BLOCKSIZE=65536
     buf = f.read(BLOCKSIZE)
+    b+=buf
     decompressed.write(do.decompress(buf))
     while len(buf) > 0 and not do.eof:
         buf = f.read(BLOCKSIZE)
+        b+=buf
         decompressed.write(do.decompress(buf))
     compressed_length = f.tell() - compressed_start - len(do.unused_data)
+    b = b[:-len(do.unused_data)]
     f.seek(compressed_start + compressed_length)
-    return decompressed.getvalue(), compressed_length
+    d = decompressed.getvalue()
+    
+    if CHECK:
+        rezcompressed = zlib.compress(d)
+        assert rezcompressed == b, "Zlib compression not reversible"
+    return d, compressed_length
     
 
 class MismatchHashException(Exception):
@@ -282,6 +307,7 @@ class RepoWriter(RepoBase):
         obj_headers = self.load_bloblist(obj_headers_list_sha)
         obj_delta_offsets = self.load_bloblist(obj_delta_offsets_list_sha)
         obj_blobs = self.load_bloblist(obj_blobs_sha)
+        obj_blobs = list(map(derecompress, obj_blobs))
         with open(abs_path, 'w+b') as f:
             self.write_pack(obj_types, obj_headers, obj_delta_offsets, obj_blobs, f)
             if CHECK:
@@ -565,6 +591,7 @@ class RepoReader(RepoBase):
             obj_types_sha = self.store_blob(bytes(object_types), blobtype="objtypes")
             obj_headers_list_sha = self.store_bloblist(object_headers, blobtype="objheader")
             obj_delta_offsets_list_sha = self.store_bloblist(object_delta_offsets, blobtype="objdelta")
+            object_blobs = list(map(recompress, object_blobs))
             obj_blobs_sha = self.store_bloblist(object_blobs, blobtype="objblobs")
             self.output[rel_path] = ('unstore_packfile', rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, pack_sha)
         else:

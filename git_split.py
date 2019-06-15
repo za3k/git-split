@@ -124,7 +124,7 @@ class RepoBase():
         with open(pack_path, 'wb') as f2:
             copy_write(f, f2)
         with open(os.devnull, 'w') as FNULL:
-            subprocess.call(["git", "index-pack", pack_path])
+            subprocess.call(["git", "index-pack", pack_path], stdout=FNULL)
         os.remove(pack_path)
         index_file = open(index_path, 'rb')
         os.remove(index_path)
@@ -159,6 +159,7 @@ class RepoBase():
             h = lst[x:x+digest_size]
             b = self.load_blob(h)
             blobs.append(b)
+        return blobs
 
 
 class RepoWriter(RepoBase):
@@ -205,19 +206,36 @@ class RepoWriter(RepoBase):
         header = bytes(x | 0x80 for x in header[:-1]) + header[-1:]
         return header
 
+    @classmethod
+    def unparse_base_offset(cls, offset):
+        varint = []
+        varint.append(offset & 0x7f)
+        while offset >= 2**7:
+            offset = offset >> 7
+            offset -= 1 # See parse_base_offset
+            varint.append(offset & 0x7f)
+        varint = bytes(x | 0x80 for x in varint[-1:0:-1]) + bytes(varint[0:1])
+        return varint
+
     def write_pack(self, objects, f):
         f.write(b'PACK')
         f.write(struct.pack(">i", 2))
         f.write(struct.pack(">i", len(objects)))
         for o in objects:
-            t, obj = o
-            header = self.unparse_object_header(t, len(obj))
-            f.write(header)
-            f.write(obj)
+            f.write(o)
         f.seek(0)
-        self_sha = self.sha1_file(f)
-        f.seek(0)
+        self_sha = sha1_file(f)
+        f.seek(0,2) # end of the file
         f.write(self_sha)
+    
+    def unstore_packfile(self, rel_path, objlist_hash, pack_sha):
+        abs_path = os.path.join(self.base, rel_path)
+        obj_reprs = self.load_bloblist(objlist_hash)
+        with open(abs_path, 'w+b') as f:
+            self.write_pack(obj_reprs, f)
+            f.seek(0)
+            actual_pack_sha = sha1_file(f)
+            assert pack_sha == actual_pack_sha, "Pack geneated did not match the one stored: {} (length {})".format(rel_path, f.tell())
 
     def unstore_unchanged(self, rel_path, sha):
         abs_path = os.path.join(self.base, rel_path)
@@ -344,6 +362,8 @@ class RepoReader(RepoBase):
 
     def parse_pack(self, f):
         # Read header
+        combined_header = f.read(12)
+        f.seek(0)
         header = f.read(4)
         assert header == b'PACK', "Packfile header is wrong--this is probably not a packfile"
         version, = struct.unpack(">i", f.read(4))
@@ -362,6 +382,7 @@ class RepoReader(RepoBase):
         # Read the individual objects
         object_reprs = []
         for i in range(num_objects):
+            file_pos = f.tell()
             t, size, header_buffer = self.parse_object_header(f)
             if t in (1,2,3,4): # un-deltafied
                 pos = f.tell()
@@ -370,16 +391,50 @@ class RepoReader(RepoBase):
                 f.seek(pos)
                 compressed_buffer = f.read(compressed_length)
                 gh = git_hash(t, decompressed_buffer)
-                print("Parsed an object:", gh, PRINTABLE_TYPES[t], len(decompressed_buffer), compressed_length+len(header_buffer), pos)
+                #print("Parsed an object:", gh, PRINTABLE_TYPES[t], len(decompressed_buffer), compressed_length+len(header_buffer), file_pos)
+                object_reprs.append(header_buffer + compressed_buffer)
             elif t == 6:
-                assert False, "Deltas not yet supported"
+                pos = f.tell()
+                offset, bytes_read = self.parse_base_offset(f)
+                f.seek(pos)
+                offset_buffer = f.read(bytes_read)
+                pos = f.tell()
+                decompressed_buffer, compressed_length = decompress(f)
+                f.seek(pos)
+                compressed_buffer = f.read(compressed_length)
+                #print("Parsed a delta:", len(decompressed_buffer), compressed_length + len(header_buffer) + bytes_read, pos, file_pos)
+                object_reprs.append(header_buffer + offset_buffer + compressed_buffer)
             else:
                 assert False, "Invalid git object type"
-            object_reprs.append(header_buffer + compressed_buffer)
+        assert len(object_reprs) == num_objects
                 
         assert f.tell() == length-20, "Stopped reading objects at the wrong point"
 
-        return object_reprs
+        return combined_header, object_reprs, self_sha
+
+    @classmethod
+    def parse_base_offset(cls, f):
+        """Gives the parsed (negative) varint offset as a positive number, as well as the length of the parsed number itself (in case you actually need the offset after reading)"""
+        parsed = io.BytesIO()
+        c = f.read(1)
+        parsed.write(c)
+        bytes_read = 1
+        offset = c[0] & 0x7f
+        while c[0] & 0x80:
+            offset += 1 # This is a stupidly marginal space-optimizing hack from linux@horizon.com
+            offset = offset << 7
+            c = f.read(1)
+            parsed.write(c)
+            bytes_read += 1
+            offset = offset + (c[0] & 0x7f)
+        # varint has been parsed
+
+        buf = parsed.getvalue()
+        redo = RepoWriter.unparse_base_offset(offset)
+        assert redo == buf, "parse/unparse base offset were not opposites"
+        #print("Base offset parsed and reconstructed:", offset, bytes_read)
+        return offset, bytes_read
+        
 
     @classmethod
     def parse_object_header(cls, f):
@@ -404,7 +459,7 @@ class RepoReader(RepoBase):
         
         redo = RepoWriter.unparse_object_header(t, size)
         assert RepoWriter.unparse_object_header(t, size) == buf, "parse/unparse object header were not opposites"
-        print("One header parsed and reconstructed:", t, size)
+        #print("One header parsed and reconstructed:", t, size)
         return t, size, buf
 
     def store_unchanged(self, rel_path, f):
@@ -435,12 +490,17 @@ class RepoReader(RepoBase):
     def store_object_file(self, rel_path, f):
         self.store_unchanged(rel_path, f)
 
-    def store_packfile_and_index(self, rel_path, f):
+    def store_packfile_and_index(self, rel_path, f, store_objects=True):
         # Store packfile
-        objs = self.parse_pack(f)
-        h = self.store_bloblist(objs)
-        self.store_unchanged(rel_path, f)
+        _, obj_repr_list, _ = self.parse_pack(f)
         f.seek(0)
+        if store_objects:
+            pack_sha = self.all_files[rel_path]
+            obj_repr_list_sha = self.store_bloblist(obj_repr_list)
+            self.output[rel_path] = ('unstore_packfile', rel_path, obj_repr_list_sha, pack_sha)
+        else:
+            self.store_unchanged(rel_path, f)
+            f.seek(0)
 
         # Store pack index file
         index_path = rel_path[:-5]+'.idx'

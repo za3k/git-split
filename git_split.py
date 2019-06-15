@@ -17,8 +17,11 @@ DEBUG=False # Print extra debugging informatio
 SMALL_LITERALS=False # Try to store <20 byte objects directly to avoid hash overhead. Currently adds net overhead.
 
 def sha1_path(path):
-    with open(path, 'rb') as f:
-        return sha1_file(f)
+    if os.path.isfile(path):
+        with open(path, 'rb') as f:
+            return sha1_file(f)
+    elif os.path.isdir(path):
+        return RepoBase.DIRECTORY_SHA
 def sha1_file(f):
     hasher = hashlib.sha1()
     BLOCKSIZE=65536
@@ -233,15 +236,22 @@ class RepoWriter(RepoBase):
         else:
             parser.store = serialized_store
         parser.output = pickle.load(f)
+        parser.expected_shas = pickle.load(f)
         return parser
 
     def unparse(self, extract_path):
         self.base = extract_path
         for rel_path, (action, *args) in self.output.items():
-            if hasattr(self, action):
-                getattr(self, action)(*args)
-            else:
+            if not hasattr(self, action):
                 raise Exception("Unexpected output action {}".format(action))
+            getattr(self, action)(*args)
+            if CHECK:
+                abs_path = os.path.join(self.base, rel_path)
+                assert sha1_path(abs_path) == self.expected_shas[rel_path], "File reconstructed wrong: {}".format(rel_path)
+        if CHECK:
+            for rel_path, sha in self.expected_shas.items():
+                abs_path = os.path.join(self.base, rel_path)
+                assert sha1_path(abs_path) == self.expected_shas[rel_path], "File reconstructed wrong: {}".format(rel_path)
 
     @classmethod
     def unparse_object_header(cls, t, size):
@@ -286,7 +296,7 @@ class RepoWriter(RepoBase):
             f.seek(0,2) # end of the file
         f.write(self_sha)
     
-    def unstore_packfile(self, rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, obj_delta_blobs_sha, pack_sha):
+    def unstore_packfile(self, rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, obj_delta_blobs_sha):
         abs_path = os.path.join(self.base, rel_path)
         obj_types = list(self.load_blob(obj_types_sha))
         obj_headers = self.load_bloblist(obj_headers_list_sha)
@@ -295,10 +305,6 @@ class RepoWriter(RepoBase):
         obj_delta_blobs = self.load_bloblist(obj_delta_blobs_sha)
         with open(abs_path, 'w+b') as f:
             self.write_pack(obj_types, obj_headers, obj_delta_offsets, obj_blobs, obj_delta_blobs, f)
-            if CHECK:
-                f.seek(0)
-                actual_pack_sha = sha1_file(f)
-                assert pack_sha == actual_pack_sha, "Pack generated did not match the one stored: {} (length {})".format(rel_path, f.tell())
 
     def unstore_unchanged(self, rel_path, sha):
         abs_path = os.path.join(self.base, rel_path)
@@ -324,7 +330,8 @@ class RepoWriter(RepoBase):
         assert os.path.exists(abs_from_file), "Generated index file relies on non-existent packfile: {}".format(from_file)
         with open(abs_from_file, 'rb') as f:
             index_file = self.generate_index(f)
-        assert sha1_file(index_file) == sha, "Generated index file had wrong hash: {}".format(rel_path)
+        if CHECK:
+            assert sha1_file(index_file) == sha, "Generated index file had wrong hash: {}".format(rel_path)
         index_file.seek(0)
         with open(abs_path, 'wb') as f:
             copy_write(index_file, f)
@@ -422,6 +429,7 @@ class RepoReader(RepoBase):
         else:
             pickle.dump(self.store)
         pickle.dump(self.output, f)
+        pickle.dump(self.all_files, f)
 
     def parse_pack(self, f):
         # Read header
@@ -577,7 +585,7 @@ class RepoReader(RepoBase):
             obj_delta_offsets_list_sha = self.store_bloblist(object_delta_offsets, blobtype="objdelta")
             obj_blobs_sha = self.store_bloblist(object_blobs, blobtype="objblobs")
             obj_delta_blobs_sha = self.store_bloblist(object_delta_blobs, blobtype="objdeltablobs")
-            self.output[rel_path] = ('unstore_packfile', rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, obj_delta_blobs_sha, pack_sha)
+            self.output[rel_path] = ('unstore_packfile', rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, obj_delta_blobs_sha)
         else:
             self.store_unchanged(rel_path, f)
             f.seek(0)

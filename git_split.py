@@ -21,11 +21,12 @@ def sha1_file(f):
     while len(buf) > 0:
         hasher.update(buf)
         buf = f.read(BLOCKSIZE)
-    return hasher.hexdigest()
+    return hasher.digest()
 def sha1_directory(d):
     return subprocess.getoutput("find {} -type f | sort | xargs sha1sum | cut -f1 -d' ' | sha1sum | cut -f1 -d' '".format(d))
 
 def copy_write(fr, to):
+    BLOCKSIZE=65536
     buf = fr.read(BLOCKSIZE)
     while len(buf) > 0:
         to.write(buf)
@@ -47,7 +48,7 @@ def git_hash(t, b):
     buf.write(b'\0')
     buf.write(b)
     buf.seek(0)
-    return sha1_file(buf)
+    return hashlib.sha1(buf.getbuffer()).hexdigest()
 
 def decompress(f):
     do = zlib.decompressobj()
@@ -97,19 +98,19 @@ class RepoBase():
         'refs': DIRECTORY_SHA,
         'refs/heads': DIRECTORY_SHA,
         'refs/tags': DIRECTORY_SHA,
-        'description': '9635f1b7e12c045212819dd934d809ef07efa2f4',
-        'hooks/applypatch-msg.sample': '4de88eb95a5e93fd27e78b5fb3b5231a8d8917dd',
-        'hooks/commit-msg.sample': 'ee1ed5aad98a435f2020b6de35c173b75d9affac',
-        'hooks/fsmonitor-watchman.sample': {'f7c0aa40cb0d620ff0bca3efe3521ec79e5d7156', None},
-        'hooks/post-update.sample': 'b614c2f63da7dca9f1db2e7ade61ef30448fc96c',
-        'hooks/pre-applypatch.sample': 'f208287c1a92525de9f5462e905a9d31de1e2d75',
-        'hooks/pre-commit.sample': {'33729ad4ce51acda35094e581e4088f3167a0af8', '36aed8976dcc08b5076844f0ec645b18bc37758f'},
-        'hooks/prepare-commit-msg.sample': {'2584806ba147152ae005cb675aa4f01d5d068456', '2b6275eda365cad50d167fe3a387c9bc9fedd54f'},
-        'hooks/pre-push.sample': '5c8518bfd1d1d3d2c1a7194994c0a16d8a313a41',
-        'hooks/pre-rebase.sample': {'288efdc0027db4cfd8b7c47c4aeddba09b6ded12', '18be3eb275c1decd3614e139f5a311b75f1b0ab8'},
-        'hooks/pre-receive.sample': '705a17d259e7896f0082fe2e9f2c0c3b127be5ac',
-        'hooks/update.sample': 'e729cd61b27c128951d139de8e7c63d1a3758dde',
-        'info/exclude': 'c879df015d97615050afa7b9641e3352a1e701ac',
+        'description': bytes(bytearray.fromhex('9635f1b7e12c045212819dd934d809ef07efa2f4')),
+        'hooks/applypatch-msg.sample': bytes(bytearray.fromhex('4de88eb95a5e93fd27e78b5fb3b5231a8d8917dd')),
+        'hooks/commit-msg.sample': bytes(bytearray.fromhex('ee1ed5aad98a435f2020b6de35c173b75d9affac')),
+        'hooks/fsmonitor-watchman.sample': {bytes(bytearray.fromhex('f7c0aa40cb0d620ff0bca3efe3521ec79e5d7156')), None},
+        'hooks/post-update.sample': bytes(bytearray.fromhex('b614c2f63da7dca9f1db2e7ade61ef30448fc96c')),
+        'hooks/pre-applypatch.sample': bytes(bytearray.fromhex('f208287c1a92525de9f5462e905a9d31de1e2d75')),
+        'hooks/pre-commit.sample': {bytes(bytearray.fromhex('33729ad4ce51acda35094e581e4088f3167a0af8')), bytes(bytearray.fromhex('36aed8976dcc08b5076844f0ec645b18bc37758f'))},
+        'hooks/prepare-commit-msg.sample': {bytes(bytearray.fromhex('2584806ba147152ae005cb675aa4f01d5d068456')), bytes(bytearray.fromhex('2b6275eda365cad50d167fe3a387c9bc9fedd54f'))},
+        'hooks/pre-push.sample': bytes(bytearray.fromhex('5c8518bfd1d1d3d2c1a7194994c0a16d8a313a41')),
+        'hooks/pre-rebase.sample': {bytes(bytearray.fromhex('288efdc0027db4cfd8b7c47c4aeddba09b6ded12')), bytes(bytearray.fromhex('18be3eb275c1decd3614e139f5a311b75f1b0ab8'))},
+        'hooks/pre-receive.sample': bytes(bytearray.fromhex('705a17d259e7896f0082fe2e9f2c0c3b127be5ac')),
+        'hooks/update.sample': bytes(bytearray.fromhex('e729cd61b27c128951d139de8e7c63d1a3758dde')),
+        'info/exclude': bytes(bytearray.fromhex('c879df015d97615050afa7b9641e3352a1e701ac')),
     }
 
     def __init__(self, store=None):
@@ -123,14 +124,14 @@ class RepoBase():
         with open(pack_path, 'wb') as f2:
             copy_write(f, f2)
         with open(os.devnull, 'w') as FNULL:
-            subprocess.call(["git", "index-pack", pack_path], stdout=FNULL)
+            subprocess.call(["git", "index-pack", pack_path])
         os.remove(pack_path)
         index_file = open(index_path, 'rb')
         os.remove(index_path)
         return index_file
 
     def store_blob(self, b):
-        h = hashlib.sha1(b).hexdigest()
+        h = hashlib.sha1(b).digest()
         if h in self.store:
             assert self.store[h] == b, "Two distinct blobs stored with the same hash (collision): {}".format(h)
         else:
@@ -142,7 +143,7 @@ class RepoBase():
         hs = []
         for blob in blobs:
             hs.append(self.store_blob(blob))
-        return self.store_blob(''.join(hs))
+        return self.store_blob(b''.join(hs))
 
     def load_blob(self, h):
         b = self.store[h]
@@ -152,10 +153,10 @@ class RepoBase():
     def load_bloblist(self, h):
         lst = self.load_blob(h)
         blobs = []
-        hexdigest_size = hashlib.sha1().digest_size * 2
-        assert len(lst) % hexdigest_size == 0, "Hex digest list is the wrong size"
-        for x in range(0, len(lst), hexdigest_size):
-            h = lst[x:x+hexdigest_size]
+        digest_size = hashlib.sha1().digest_size
+        assert len(lst) % digest_size == 0, "Hex digest list is the wrong size"
+        for x in range(0, len(lst), digest_size):
+            h = lst[x:x+digest_size]
             b = self.load_blob(h)
             blobs.append(b)
 
@@ -169,7 +170,7 @@ class RepoWriter(RepoBase):
         for path in glob.glob('expected/*'):
             with open(path, 'rb') as f:
                 b = f.read()
-                h = hashlib.sha1(b).hexdigest()
+                h = hashlib.sha1(b).digest()
                 self.expected_blobs[h] = b
 
     @classmethod
@@ -369,7 +370,7 @@ class RepoReader(RepoBase):
                 f.seek(pos)
                 compressed_buffer = f.read(compressed_length)
                 gh = git_hash(t, decompressed_buffer)
-                print("Parsed an object: ", gh, PRINTABLE_TYPES[t], len(decompressed_buffer), compressed_length+len(header_buffer), pos)
+                print("Parsed an object:", gh, PRINTABLE_TYPES[t], len(decompressed_buffer), compressed_length+len(header_buffer), pos)
             elif t == 6:
                 assert False, "Deltas not yet supported"
             else:
@@ -387,7 +388,6 @@ class RepoReader(RepoBase):
         c = f.read(1)
         parsed.write(c)
         t = (c[0] >> 4) & 0x7
-        print(t)
         assert t in (1,2,3,4,6,7) # Valid packfile object types: 0 and 5 are invalid
         assert t in (1,2,3,4,6), "Ref deltas are not really expected in packfiles on disk"
         size = c[0] & 15
@@ -404,7 +404,7 @@ class RepoReader(RepoBase):
         
         redo = RepoWriter.unparse_object_header(t, size)
         assert RepoWriter.unparse_object_header(t, size) == buf, "parse/unparse object header were not opposites"
-        print("One header parsed and reconstructed: ", t, size)
+        print("One header parsed and reconstructed:", t, size)
         return t, size, buf
 
     def store_unchanged(self, rel_path, f):
@@ -438,7 +438,7 @@ class RepoReader(RepoBase):
     def store_packfile_and_index(self, rel_path, f):
         # Store packfile
         objs = self.parse_pack(f)
-        h = self.store_bloblist(hs)
+        h = self.store_bloblist(objs)
         self.store_unchanged(rel_path, f)
         f.seek(0)
 

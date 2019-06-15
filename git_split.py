@@ -55,22 +55,6 @@ def git_hash(t, b):
     buf.seek(0)
     return hashlib.sha1(buf.getbuffer()).hexdigest()
 
-def recompress(b):
-    import lzma
-    if CHECK:
-        d = zlib.decompress(b)
-        rezcompressed = zlib.compress(d)
-        assert rezcompressed == b, "Zlib compression not reversible"
-    return d
-    #return lzma.compress(d, lzma.FORMAT_ALONE)
-
-def derecompress(b):
-    import lzma
-    #d = lzma.decompress(b, lzma.FORMAT_ALONE)
-    d=b
-    c = zlib.compress(d)
-    return c
-
 def decompress(f):
     do = zlib.decompressobj()
     b = b''
@@ -90,9 +74,6 @@ def decompress(f):
     f.seek(compressed_start + compressed_length)
     d = decompressed.getvalue()
     
-    if CHECK:
-        rezcompressed = zlib.compress(d)
-        assert rezcompressed == b, "Zlib compression not reversible"
     return d, compressed_length
     
 
@@ -285,35 +266,39 @@ class RepoWriter(RepoBase):
         varint = bytes(x | 0x80 for x in varint[-1:0:-1]) + bytes(varint[0:1])
         return varint
 
-    def write_pack(self, obj_types, obj_headers, obj_delta_offsets, obj_blobs, f, self_sha=None):
-        do = iter(obj_delta_offsets)
+    def write_pack(self, obj_types, obj_headers, obj_delta_offsets, obj_blobs, obj_delta_blobs, f, self_sha=None):
+        doi = iter(obj_delta_offsets)
+        bi = iter(obj_blobs)
+        dbi = iter(obj_delta_blobs)
         f.write(b'PACK')
         f.write(struct.pack(">i", 2))
-        f.write(struct.pack(">i", len(obj_blobs)))
-        for t, header, blob in zip(obj_types, obj_headers, obj_blobs):
+        f.write(struct.pack(">i", len(obj_headers)))
+        for t, header in zip(obj_types, obj_headers):
             f.write(header)
             if t == 6:
-                f.write(next(do))
-            f.write(blob)
+                f.write(next(doi))
+                f.write(next(dbi))
+            else:
+                f.write(next(bi))
         if self_sha is None:
             f.seek(0)
             self_sha = sha1_file(f)
             f.seek(0,2) # end of the file
         f.write(self_sha)
     
-    def unstore_packfile(self, rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, pack_sha):
+    def unstore_packfile(self, rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, obj_delta_blobs_sha, pack_sha):
         abs_path = os.path.join(self.base, rel_path)
         obj_types = list(self.load_blob(obj_types_sha))
         obj_headers = self.load_bloblist(obj_headers_list_sha)
         obj_delta_offsets = self.load_bloblist(obj_delta_offsets_list_sha)
         obj_blobs = self.load_bloblist(obj_blobs_sha)
-        obj_blobs = list(map(derecompress, obj_blobs))
+        obj_delta_blobs = self.load_bloblist(obj_delta_blobs_sha)
         with open(abs_path, 'w+b') as f:
-            self.write_pack(obj_types, obj_headers, obj_delta_offsets, obj_blobs, f)
+            self.write_pack(obj_types, obj_headers, obj_delta_offsets, obj_blobs, obj_delta_blobs, f)
             if CHECK:
                 f.seek(0)
                 actual_pack_sha = sha1_file(f)
-                assert pack_sha == actual_pack_sha, "Pack geneated did not match the one stored: {} (length {})".format(rel_path, f.tell())
+                assert pack_sha == actual_pack_sha, "Pack generated did not match the one stored: {} (length {})".format(rel_path, f.tell())
 
     def unstore_unchanged(self, rel_path, sha):
         abs_path = os.path.join(self.base, rel_path)
@@ -462,6 +447,7 @@ class RepoReader(RepoBase):
         object_headers = []
         object_delta_offsets = []
         object_blobs = []
+        object_delta_blobs = []
         for i in range(num_objects):
             file_pos = f.tell()
             t, size, header_buffer = self.parse_object_header(f)
@@ -491,17 +477,15 @@ class RepoReader(RepoBase):
                 object_types.append(t)
                 object_headers.append(header_buffer)
                 object_delta_offsets.append(offset_buffer)
-                object_blobs.append(compressed_buffer)
+                object_delta_blobs.append(compressed_buffer)
             else:
                 assert False, "Invalid git object type"
         assert len(object_types) == num_objects
-        assert len(object_blobs) == num_objects
         assert len(object_headers) == num_objects
-        assert len(object_delta_offsets) == len(list(t for t in object_types if t==6))
                 
         assert f.tell() == length-20, "Stopped reading objects at the wrong point"
 
-        return object_types, object_headers, object_delta_offsets, object_blobs
+        return object_types, object_headers, object_delta_offsets, object_blobs, object_delta_blobs
 
     @classmethod
     def parse_base_offset(cls, f):
@@ -584,16 +568,16 @@ class RepoReader(RepoBase):
 
     def store_packfile_and_index(self, rel_path, f, store_objects=True):
         # Store packfile
-        object_types, object_headers, object_delta_offsets, object_blobs = self.parse_pack(f)
+        object_types, object_headers, object_delta_offsets, object_blobs, object_delta_blobs = self.parse_pack(f)
         f.seek(0)
         if store_objects:
             pack_sha = self.all_files[rel_path]
             obj_types_sha = self.store_blob(bytes(object_types), blobtype="objtypes")
             obj_headers_list_sha = self.store_bloblist(object_headers, blobtype="objheader")
             obj_delta_offsets_list_sha = self.store_bloblist(object_delta_offsets, blobtype="objdelta")
-            object_blobs = list(map(recompress, object_blobs))
             obj_blobs_sha = self.store_bloblist(object_blobs, blobtype="objblobs")
-            self.output[rel_path] = ('unstore_packfile', rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, pack_sha)
+            obj_delta_blobs_sha = self.store_bloblist(object_delta_blobs, blobtype="objdeltablobs")
+            self.output[rel_path] = ('unstore_packfile', rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, obj_delta_blobs_sha, pack_sha)
         else:
             self.store_unchanged(rel_path, f)
             f.seek(0)

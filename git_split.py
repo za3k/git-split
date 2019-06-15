@@ -10,6 +10,11 @@ import subprocess
 import sys
 import tempfile
 import zlib
+from collections import defaultdict
+
+CHECK=True # Verify each step
+DEBUG=False # Print extra debugging informatio
+SMALL_LITERALS=False # Try to store <20 byte objects directly to avoid hash overhead. Currently adds net overhead.
 
 def sha1_path(path):
     with open(path, 'rb') as f:
@@ -113,9 +118,10 @@ class RepoBase():
         'info/exclude': bytes(bytearray.fromhex('c879df015d97615050afa7b9641e3352a1e701ac')),
     }
 
-    def __init__(self, store=None):
+    def __init__(self, store=None, types=None):
         self.my_blobs = set()
         self.store = store if store is not None else {}
+        self.types = types if types is not None else {}
         self.working_dir = tempfile.TemporaryDirectory()
 
     def generate_index(self, f):
@@ -130,30 +136,67 @@ class RepoBase():
         os.remove(index_path)
         return index_file
 
-    def store_blob(self, b):
-        h = hashlib.sha1(b).digest()
-        if h in self.store:
-            assert self.store[h] == b, "Two distinct blobs stored with the same hash (collision): {}".format(h)
-        else:
-            self.store[h] = b
-        self.my_blobs.add(h)
-        return h
 
-    def store_bloblist(self, blobs):
+    def store_blob(self, b, blobtype="untagged"):
+        if SMALL_LITERALS:
+            if len(b) > 20:
+                h = hashlib.sha1(b).digest()
+                if CHECK:
+                    if h in self.store:
+                        assert self.store[h] == b, "Two distinct blobs stored with the same hash (collision): {}".format(h)
+                    else:
+                        self.store[h] = b
+                        self.types[h] = blobtype
+                else:
+                    self.store[h] = b
+                    self.types[h] = blobtype
+                self.my_blobs.add(h)
+                return b'H:' + h
+            else:
+                return b'L' + bytes([len(b)]) + b + ((20-len(b))*b' ')
+        else:
+            h = hashlib.sha1(b).digest()
+            if CHECK:
+                if h in self.store:
+                    assert self.store[h] == b, "Two distinct blobs stored with the same hash (collision): {}".format(h)
+                else:
+                    self.store[h] = b
+                    self.types[h] = blobtype
+            else:
+                self.store[h] = b
+                self.types[h] = blobtype
+            self.my_blobs.add(h)
+            return h
+
+    def store_bloblist(self, blobs, blobtype="untagged"):
         hs = []
         for blob in blobs:
-            hs.append(self.store_blob(blob))
-        return self.store_blob(b''.join(hs))
+            hs.append(self.store_blob(blob, blobtype=blobtype))
+        return self.store_blob(b''.join(hs), blobtype=blobtype+"_list")
 
     def load_blob(self, h):
-        b = self.store[h]
-        assert h in self.my_blobs
-        return b
+        if SMALL_LITERALS:
+            if h.startswith(b'H:'):
+                b = self.store[h[2:]]
+                assert h[2:] in self.my_blobs
+                return b
+            elif h.startswith(b'L'):
+                l = h[1]
+                return h[2:l+2]
+            else:
+                assert False
+        else:
+            b = self.store[h]
+            assert h in self.my_blobs
+            return b
 
     def load_bloblist(self, h):
         lst = self.load_blob(h)
         blobs = []
-        digest_size = hashlib.sha1().digest_size
+        if SMALL_LITERALS:
+            digest_size = hashlib.sha1().digest_size + 2
+        else:
+            digest_size = hashlib.sha1().digest_size
         assert len(lst) % digest_size == 0, "Hex digest list is the wrong size"
         for x in range(0, len(lst), digest_size):
             h = lst[x:x+digest_size]
@@ -217,25 +260,34 @@ class RepoWriter(RepoBase):
         varint = bytes(x | 0x80 for x in varint[-1:0:-1]) + bytes(varint[0:1])
         return varint
 
-    def write_pack(self, objects, f):
+    def write_pack(self, obj_types, obj_headers, obj_delta_offsets, obj_blobs, f, self_sha=None):
+        do = iter(obj_delta_offsets)
         f.write(b'PACK')
         f.write(struct.pack(">i", 2))
-        f.write(struct.pack(">i", len(objects)))
-        for o in objects:
-            f.write(o)
-        f.seek(0)
-        self_sha = sha1_file(f)
-        f.seek(0,2) # end of the file
+        f.write(struct.pack(">i", len(obj_blobs)))
+        for t, header, blob in zip(obj_types, obj_headers, obj_blobs):
+            f.write(header)
+            if t == 6:
+                f.write(next(do))
+            f.write(blob)
+        if self_sha is None:
+            f.seek(0)
+            self_sha = sha1_file(f)
+            f.seek(0,2) # end of the file
         f.write(self_sha)
     
-    def unstore_packfile(self, rel_path, objlist_hash, pack_sha):
+    def unstore_packfile(self, rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, pack_sha):
         abs_path = os.path.join(self.base, rel_path)
-        obj_reprs = self.load_bloblist(objlist_hash)
+        obj_types = list(self.load_blob(obj_types_sha))
+        obj_headers = self.load_bloblist(obj_headers_list_sha)
+        obj_delta_offsets = self.load_bloblist(obj_delta_offsets_list_sha)
+        obj_blobs = self.load_bloblist(obj_blobs_sha)
         with open(abs_path, 'w+b') as f:
-            self.write_pack(obj_reprs, f)
-            f.seek(0)
-            actual_pack_sha = sha1_file(f)
-            assert pack_sha == actual_pack_sha, "Pack geneated did not match the one stored: {} (length {})".format(rel_path, f.tell())
+            self.write_pack(obj_types, obj_headers, obj_delta_offsets, obj_blobs, f)
+            if CHECK:
+                f.seek(0)
+                actual_pack_sha = sha1_file(f)
+                assert pack_sha == actual_pack_sha, "Pack geneated did not match the one stored: {} (length {})".format(rel_path, f.tell())
 
     def unstore_unchanged(self, rel_path, sha):
         abs_path = os.path.join(self.base, rel_path)
@@ -279,8 +331,8 @@ class RepoReader(RepoBase):
         re.compile('^objects/pack/pack-.*\.pack$'): 'store_packfile_and_index',
     }
 
-    def __init__(self, base_repo_path=None, blob_store=None):
-        super(RepoReader, self).__init__(store=blob_store)
+    def __init__(self, base_repo_path=None, blob_store=None, blob_types=None):
+        super(RepoReader, self).__init__(store=blob_store, types=blob_types)
         self.base = base_repo_path
         self.expected_files = dict()
         self.unexpected_files = dict()
@@ -380,7 +432,10 @@ class RepoReader(RepoBase):
         f.seek(12)
 
         # Read the individual objects
-        object_reprs = []
+        object_types = []
+        object_headers = []
+        object_delta_offsets = []
+        object_blobs = []
         for i in range(num_objects):
             file_pos = f.tell()
             t, size, header_buffer = self.parse_object_header(f)
@@ -390,9 +445,12 @@ class RepoReader(RepoBase):
                 assert len(decompressed_buffer) == size, "Size wrong"
                 f.seek(pos)
                 compressed_buffer = f.read(compressed_length)
-                gh = git_hash(t, decompressed_buffer)
-                #print("Parsed an object:", gh, PRINTABLE_TYPES[t], len(decompressed_buffer), compressed_length+len(header_buffer), file_pos)
-                object_reprs.append(header_buffer + compressed_buffer)
+                if DEBUG:
+                    gh = git_hash(t, decompressed_buffer)
+                    print("Parsed an object:", gh, PRINTABLE_TYPES[t], len(decompressed_buffer), compressed_length+len(header_buffer), file_pos)
+                object_types.append(t)
+                object_headers.append(header_buffer)
+                object_blobs.append(compressed_buffer)
             elif t == 6:
                 pos = f.tell()
                 offset, bytes_read = self.parse_base_offset(f)
@@ -402,15 +460,22 @@ class RepoReader(RepoBase):
                 decompressed_buffer, compressed_length = decompress(f)
                 f.seek(pos)
                 compressed_buffer = f.read(compressed_length)
-                #print("Parsed a delta:", len(decompressed_buffer), compressed_length + len(header_buffer) + bytes_read, pos, file_pos)
-                object_reprs.append(header_buffer + offset_buffer + compressed_buffer)
+                if DEBUG:
+                    print("Parsed a delta:", len(decompressed_buffer), compressed_length + len(header_buffer) + bytes_read, pos, file_pos)
+                object_types.append(t)
+                object_headers.append(header_buffer)
+                object_delta_offsets.append(offset_buffer)
+                object_blobs.append(compressed_buffer)
             else:
                 assert False, "Invalid git object type"
-        assert len(object_reprs) == num_objects
+        assert len(object_types) == num_objects
+        assert len(object_blobs) == num_objects
+        assert len(object_headers) == num_objects
+        assert len(object_delta_offsets) == len(list(t for t in object_types if t==6))
                 
         assert f.tell() == length-20, "Stopped reading objects at the wrong point"
 
-        return combined_header, object_reprs, self_sha
+        return object_types, object_headers, object_delta_offsets, object_blobs
 
     @classmethod
     def parse_base_offset(cls, f):
@@ -428,11 +493,11 @@ class RepoReader(RepoBase):
             bytes_read += 1
             offset = offset + (c[0] & 0x7f)
         # varint has been parsed
-
-        buf = parsed.getvalue()
-        redo = RepoWriter.unparse_base_offset(offset)
-        assert redo == buf, "parse/unparse base offset were not opposites"
-        #print("Base offset parsed and reconstructed:", offset, bytes_read)
+        if CHECK:
+            buf = parsed.getvalue()
+            redo = RepoWriter.unparse_base_offset(offset)
+            assert redo == buf, "parse/unparse base offset were not opposites"
+            #print("Base offset parsed and reconstructed:", offset, bytes_read)
         return offset, bytes_read
         
 
@@ -457,14 +522,15 @@ class RepoReader(RepoBase):
         n = f.tell()-start
         buf = parsed.getvalue()
         
-        redo = RepoWriter.unparse_object_header(t, size)
-        assert RepoWriter.unparse_object_header(t, size) == buf, "parse/unparse object header were not opposites"
-        #print("One header parsed and reconstructed:", t, size)
+        if CHECK:
+            redo = RepoWriter.unparse_object_header(t, size)
+            assert RepoWriter.unparse_object_header(t, size) == buf, "parse/unparse object header were not opposites"
+            #print("One header parsed and reconstructed:", t, size)
         return t, size, buf
 
     def store_unchanged(self, rel_path, f):
         c = f.read()
-        h = self.store_blob(c)
+        h = self.store_blob(c, blobtype="unchanged_file")
         self.output[rel_path] = ('unstore_unchanged', rel_path, h)
 
     def store_directory(self, rel_path):
@@ -492,12 +558,15 @@ class RepoReader(RepoBase):
 
     def store_packfile_and_index(self, rel_path, f, store_objects=True):
         # Store packfile
-        _, obj_repr_list, _ = self.parse_pack(f)
+        object_types, object_headers, object_delta_offsets, object_blobs = self.parse_pack(f)
         f.seek(0)
         if store_objects:
             pack_sha = self.all_files[rel_path]
-            obj_repr_list_sha = self.store_bloblist(obj_repr_list)
-            self.output[rel_path] = ('unstore_packfile', rel_path, obj_repr_list_sha, pack_sha)
+            obj_types_sha = self.store_blob(bytes(object_types), blobtype="objtypes")
+            obj_headers_list_sha = self.store_bloblist(object_headers, blobtype="objheader")
+            obj_delta_offsets_list_sha = self.store_bloblist(object_delta_offsets, blobtype="objdelta")
+            obj_blobs_sha = self.store_bloblist(object_blobs, blobtype="objblobs")
+            self.output[rel_path] = ('unstore_packfile', rel_path, obj_types_sha, obj_headers_list_sha, obj_delta_offsets_list_sha, obj_blobs_sha, pack_sha)
         else:
             self.store_unchanged(rel_path, f)
             f.seek(0)
@@ -528,30 +597,45 @@ class RepoReader(RepoBase):
 if __name__ == '__main__':
     parsers = {}
     common = {}
+    common_types = {}
     per_repo_combined = 0
     for repo in sys.argv[1:]:
         print("Parsing repo {}".format(repo))
         # Read the repo
-        parsers[repo] = RepoReader(repo, blob_store=common)
+        parsers[repo] = RepoReader(repo, blob_store=common, blob_types=common_types)
         parsers[repo].parse()
-        expected_sha1 = sha1_directory(repo)
-        out = io.BytesIO()
-        parsers[repo].serialize(out, only_my_blobs=True)
-        out.seek(0)
+        if CHECK:
+            expected_sha1 = sha1_directory(repo)
+            out = io.BytesIO()
+            parsers[repo].serialize(out, only_my_blobs=True)
+            out.seek(0)
 
-        # Restore the repo
-        ds = RepoWriter.unserialize(out)
-        d = tempfile.mkdtemp()
-        ds.unparse(d)
-        actual_sha1 = sha1_directory(d)
-        if expected_sha1 == actual_sha1:
-            repo_size = parsers[repo].get_size(blobs=False)
-            per_repo_combined += repo_size
-            print("Size of repo (no blobs) {}: {:,}".format(repo, repo_size))
-        else:
-            print("Failure--some mismatch. Temp directory was: {}".format(d))
-        subprocess.call(["rm", "-r", "-f", d])
+            # Restore the repo
+            ds = RepoWriter.unserialize(out)
+            d = tempfile.mkdtemp()
+            ds.unparse(d)
+            actual_sha1 = sha1_directory(d)
+            if expected_sha1 != actual_sha1:
+                print("Failure--some mismatch. Temp directory was: {}".format(d))
+                subprocess.call(["rm", "-r", "-f", d])
+                exit(0)
+            subprocess.call(["rm", "-r", "-f", d])
+        repo_size = parsers[repo].get_size(blobs=False)
+        per_repo_combined += repo_size
+        print("Size of repo (no blobs) {}: {:,}".format(repo, repo_size))
     print("Success--exact reproduction for all repos")
     any_parser = parsers[sys.argv[1]]
     print("Size of combined blobs: {:,}".format(any_parser.get_size() - any_parser.get_size(blobs=False)))
     print("Size of combined repos (no blobs): {:,}".format(per_repo_combined))
+    print("Number of blobs: {:,}".format(len(common)))
+
+    blob_type_counts = defaultdict(int)
+    blob_type_sizes = defaultdict(int)
+    for h,v in common.items():
+        t = common_types[h]    
+        blob_type_counts[t]+=1
+        blob_type_sizes[t]+=len(v)
+    print("Number of blobs by type")
+    print(blob_type_counts)
+    print("Size of blobs by type")
+    print(blob_type_sizes)
